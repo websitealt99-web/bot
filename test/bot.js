@@ -231,7 +231,7 @@ function attachShopCollector(msg, ownerId) {
   });
 }
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ ${client.user.tag} is online!`);
 });
 
