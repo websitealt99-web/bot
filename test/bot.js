@@ -144,8 +144,8 @@ function checkAchievements(user) {
 //  CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const SS_BASE_CD = 0_000;
-const SS_FAST_CD =  0_000;
+const SS_BASE_CD = 0;
+const SS_FAST_CD =  0;
 const SEP = '━━━━━━━━━━━━━━━━━━━━━━━━';
 
 const SHOP_ITEMS = {
