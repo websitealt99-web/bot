@@ -12,7 +12,7 @@ const mongoose = require('mongoose');
 
 // ── ENV ────────────────────────────────────────────────────────────────────────
 const TOKEN   = process.env.DISCORD_TOKEN;
-const MONGO   = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/casinobot';
+const MONGO   = process.env.MONGO_URI || 'mongodb+srv://discord_bot:EGV4dWxnGpQkaUrV@cluster0.55pdpio.mongodb.net/casinobot';
 const PREFIX  = '!';
 const JACKPOT_CHANNEL = process.env.JACKPOT_CHANNEL_ID || null; // optional
 
