@@ -273,7 +273,7 @@ async function attachShopCollector(msg, ownerId) {
 
   collector.on('collect', async (ix) => {
     if (ix.user.id !== ownerId)
-      return ix.reply({ content: "❌ Open your own shop with `!shop`", ephemeral: true });
+      return ix.reply({ content: "❌ Open your own shop with `!shop`", flags: 64 });
 
     const user = await getUser(ownerId);
     const inv  = user.inventory;
@@ -298,12 +298,12 @@ async function attachShopCollector(msg, ownerId) {
     };
     if (permanents[ix.customId]) {
       const { item, field } = permanents[ix.customId];
-      if (inv[field]) return ix.reply({ content: `❌ You already own **${item.name}**.`, ephemeral: true });
-      if (user.balance < item.price) return ix.reply({ content: `❌ Need **${fmt(item.price)}** coins, you have **${fmt(user.balance)}**.`, ephemeral: true });
+      if (inv[field]) return ix.reply({ content: `❌ You already own **${item.name}**.`, flags: 64 });
+      if (user.balance < item.price) return ix.reply({ content: `❌ Need **${fmt(item.price)}** coins, you have **${fmt(user.balance)}**.`, flags: 64 });
       user.balance  -= item.price;
       inv[field]     = true;
       await saveUser(user);
-      await ix.reply({ content: `✅ Purchased **${item.name}**!`, ephemeral: true });
+      await ix.reply({ content: `✅ Purchased **${item.name}**!`, flags: 64 });
       return ix.message.edit({ embeds: [buildShopEmbed(user, qty)], components: buildShopRows(user, qty) });
     }
 
@@ -316,20 +316,20 @@ async function attachShopCollector(msg, ownerId) {
     if (consumables[ix.customId]) {
       const { item, field } = consumables[ix.customId];
       const cost = item.price * qty;
-      if (user.balance < cost) return ix.reply({ content: `❌ Need **${fmt(cost)}** coins, you have **${fmt(user.balance)}**.`, ephemeral: true });
+      if (user.balance < cost) return ix.reply({ content: `❌ Need **${fmt(cost)}** coins, you have **${fmt(user.balance)}**.`, flags: 64 });
       user.balance -= cost;
       inv[field]    = (inv[field] || 0) + qty;
       await saveUser(user);
-      await ix.reply({ content: `✅ Purchased **${qty}× ${item.name}**! You now own **${inv[field]}**.`, ephemeral: true });
+      await ix.reply({ content: `✅ Purchased **${qty}× ${item.name}**! You now own **${inv[field]}**.`, flags: 64 });
       return ix.message.edit({ embeds: [buildShopEmbed(user, qty)], components: buildShopRows(user, qty) });
     }
 
     // Arm risk token
     if (ix.customId === 'shop_arm_risk') {
-      if ((inv.riskTokens || 0) <= 0) return ix.reply({ content: '❌ No Risk Tokens.', ephemeral: true });
-      if (armedRisk.get(ownerId)) return ix.reply({ content: '⚠️ Already armed for next round.', ephemeral: true });
+      if ((inv.riskTokens || 0) <= 0) return ix.reply({ content: '❌ No Risk Tokens.', flags: 64 });
+      if (armedRisk.get(ownerId)) return ix.reply({ content: '⚠️ Already armed for next round.', flags: 64 });
       armedRisk.set(ownerId, true);
-      return ix.reply({ content: '🔥 **Risk Token armed!** Your next BJ or Roulette round is 5× win/loss.', ephemeral: true });
+      return ix.reply({ content: '🔥 **Risk Token armed!** Your next BJ or Roulette round is 5× win/loss.', flags: 64 });
     }
   });
 
@@ -755,7 +755,7 @@ client.on('messageCreate', async (message) => {
 
     collector.on('collect', async (ix) => {
       if (ix.user.id !== userId)
-        return ix.reply({ content: "❌ This isn't your game!", ephemeral: true });
+        return ix.reply({ content: "❌ This isn't your game!", flags: 64 });
       const game = bjGames.get(gameId);
       if (!game) return;
 
