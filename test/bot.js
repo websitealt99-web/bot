@@ -47,6 +47,7 @@ const userSchema = new mongoose.Schema({
   lastHourly:     { type: Number, default: 0 },
   lastWork:       { type: Number, default: 0 },
   lastSuperSlots: { type: Number, default: 0 },
+  lastRob:        { type: Number, default: 0 },
   favoriteGame:   { type: String, default: 'None' },
   gameCounts: {
     blackjack:  { type: Number, default: 0 },
@@ -173,10 +174,25 @@ function checkAchievements(user) {
 //  CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const SS_BASE_CD = 0;   // 20 seconds
-const SS_FAST_CD =  0;   // 5 seconds
-const BANK_MAX   = 0;
+const SS_BASE_CD = 20_000;     // 20 seconds
+const SS_FAST_CD = 5_000;      // 5 seconds
+const BANK_MAX   = 5_000_000;
 const SEP        = '━━━━━━━━━━━━━━━━━━━━━━━━';
+
+// Authorized admin user IDs for !setcredit — edit this list to add/remove admins
+const ADMIN_IDS = [
+  '1109145571043836024',
+  '1069940476880359514',
+  '719091011921379359',
+];
+
+// Rob command tuning
+const ROB_COOLDOWN_MS  = 3_600_000; // 1 hour
+const ROB_MIN_BALANCE  = 50_000;    // both robber & victim need at least this
+const ROB_MIN_AMOUNT   = 10_000;
+const ROB_MAX_AMOUNT   = 250_000;
+const ROB_SUCCESS_RATE = 0.40;      // 40% success chance
+const ROB_FAIL_PENALTY = 0.50;      // lose 50% of attempted amount on failure
 
 // European roulette numbers
 const ROULETTE_RED = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
@@ -450,7 +466,7 @@ const client = new Client({
   ],
 });
 
-client.once('ready', function() { console.log('✅  ' + client.user.tag + ' online'); });
+client.once('clientReady', function() { console.log('✅  ' + client.user.tag + ' online'); });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  MESSAGE HANDLER
@@ -497,23 +513,28 @@ client.on('messageCreate', async function(message) {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  //  BANK / BANKBALANCE  (private — only the user can view)
+  //  BANK / BANKBALANCE  (private — only the user can view, no @mentions)
   // ─────────────────────────────────────────────────────────────────────────
   if (command === 'bank' || command === 'bankbalance') {
+    if (message.mentions.users.size > 0) {
+      return message.reply('❌ You can only view your own bank. Usage: `!' + command + '`');
+    }
     const u = await getUser(userId);
     const bank = u.bankBalance || 0;
+    const remaining = Math.max(0, BANK_MAX - bank);
     const embed = new EmbedBuilder()
       .setColor('#2ECC71')
       .setTitle('🏦  ' + author.username + "'s Bank")
       .setThumbnail(author.displayAvatarURL())
       .setDescription(SEP)
       .addFields(
-        { name: '💵 Wallet',        value: '**' + fmt(u.balance) + '** coins',          inline: true },
-        { name: '🏦 Bank Balance',  value: '**' + fmt(bank) + '** coins',               inline: true },
-        { name: '📊 Capacity Used', value: fmt(bank) + ' / ' + fmt(BANK_MAX),           inline: true },
+        { name: '💵 Wallet',           value: '**' + fmt(u.balance) + '** coins',  inline: true },
+        { name: '🏦 Bank Balance',     value: '**' + fmt(bank) + '** coins',       inline: true },
+        { name: '📦 Bank Max',         value: '**' + fmt(BANK_MAX) + '** coins',   inline: true },
+        { name: '📊 Capacity Used',    value: fmt(bank) + ' / ' + fmt(BANK_MAX),   inline: true },
+        { name: '✨ Remaining Space',  value: '**' + fmt(remaining) + '** coins',  inline: true },
         { name: '💡 Bank Info',
           value: 'Bank funds **cannot be gambled** — only wallet coins can.\n' +
-                 'Max capacity: **' + fmt(BANK_MAX) + '** coins.\n' +
                  'Use `!deposit` / `!withdraw` to move funds.' },
       )
       .setFooter({ text: 'Bank balance is private — only you can see this' });
@@ -891,6 +912,186 @@ client.on('messageCreate', async function(message) {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  //  GIVE  —  transfer wallet coins to another user (bank balance excluded)
+  // ─────────────────────────────────────────────────────────────────────────
+  if (command === 'give') {
+    const target = message.mentions.users.first();
+    const amount = parseInt(args[1]);
+
+    if (!target) return message.reply('❌ Usage: `!give @user <amount>`');
+    if (target.id === userId) return message.reply('❌ You cannot give coins to yourself.');
+    if (target.bot) return message.reply('❌ You cannot give coins to a bot.');
+    if (isNaN(amount) || amount <= 0) return message.reply('❌ Amount must be a positive number.');
+
+    // Atomic: deduct from sender's wallet only if they can afford it
+    const sender = await User.findOneAndUpdate(
+      { userId: userId, balance: { $gte: amount } },
+      { $inc: { balance: -amount } },
+      { new: true }
+    );
+    if (!sender) {
+      const cur = await getUser(userId);
+      return message.reply('❌ Insufficient wallet funds. You have **' + fmt(cur.balance) + '** coins.');
+    }
+
+    // Credit recipient's wallet (creates their doc via getUser if needed)
+    await getUser(target.id);
+    const recipient = await User.findOneAndUpdate(
+      { userId: target.id },
+      { $inc: { balance: amount } },
+      { new: true }
+    );
+
+    const embed = new EmbedBuilder()
+      .setColor('#2ECC71')
+      .setTitle('🤝  Coins Transferred')
+      .setDescription(SEP)
+      .addFields(
+        { name: '📤 From',        value: '<@' + userId + '>',                          inline: true },
+        { name: '📥 To',          value: '<@' + target.id + '>',                       inline: true },
+        { name: '💵 Amount',      value: '**' + fmt(amount) + '** coins',               inline: true },
+        { name: '🏦 Your Wallet', value: '**' + fmt(sender.balance) + '** coins',       inline: true },
+      )
+      .setFooter({ text: 'Only wallet balance can be transferred — bank funds are protected' });
+    return message.reply({ embeds: [embed] });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  SETCREDIT  —  admin-only, sets a user's wallet balance directly
+  // ─────────────────────────────────────────────────────────────────────────
+  if (command === 'setcredit') {
+    if (!ADMIN_IDS.includes(userId)) return; // silently ignore unauthorized users
+
+    const target = message.mentions.users.first();
+    const amount = parseInt(args[1]);
+
+    if (!target) {
+      return message.reply({ embeds: [
+        new EmbedBuilder().setColor('#FF4444').setTitle('❌ Invalid Usage').setDescription('Usage: `!setcredit @user <amount>`'),
+      ]});
+    }
+    if (isNaN(amount) || amount < 0) {
+      return message.reply({ embeds: [
+        new EmbedBuilder().setColor('#FF4444').setTitle('❌ Invalid Amount').setDescription('Amount must be a non-negative number.'),
+      ]});
+    }
+
+    await getUser(target.id);
+    const updated = await User.findOneAndUpdate(
+      { userId: target.id },
+      { $set: { balance: amount } },
+      { new: true }
+    );
+
+    const embed = new EmbedBuilder()
+      .setColor('#FFD700')
+      .setTitle('🛠  Wallet Balance Updated')
+      .setDescription(SEP)
+      .addFields(
+        { name: '👤 User',       value: '<@' + target.id + '>',                  inline: true },
+        { name: '💵 New Balance', value: '**' + fmt(updated.balance) + '** coins', inline: true },
+        { name: '🔑 Set By',     value: '<@' + userId + '>',                      inline: true },
+      )
+      .setFooter({ text: 'Admin action — !setcredit' });
+    return message.reply({ embeds: [embed] });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  ROB  —  attempt to steal wallet coins from another user (1h cooldown)
+  // ─────────────────────────────────────────────────────────────────────────
+  if (command === 'rob') {
+    const target = message.mentions.users.first();
+    const amount = parseInt(args[1]);
+
+    if (!target) return message.reply('❌ Usage: `!rob @user <amount>`');
+    if (target.id === userId) return message.reply('❌ You cannot rob yourself.');
+    if (target.bot) return message.reply('❌ You cannot rob a bot.');
+    if (isNaN(amount) || amount <= 0) return message.reply('❌ Amount must be a positive number.');
+    if (amount < ROB_MIN_AMOUNT) return message.reply('❌ Minimum rob amount is **' + fmt(ROB_MIN_AMOUNT) + '** coins.');
+    if (amount > ROB_MAX_AMOUNT) return message.reply('❌ Maximum rob amount is **' + fmt(ROB_MAX_AMOUNT) + '** coins.');
+
+    const robber = await getUser(userId);
+    const now    = Date.now();
+    const elapsed = now - (robber.lastRob || 0);
+    if (elapsed < ROB_COOLDOWN_MS) {
+      const rem = ROB_COOLDOWN_MS - elapsed;
+      return message.reply('⏳ Rob is on cooldown! Try again in **' + fmtCooldown(rem) + '**.');
+    }
+
+    if (robber.balance < ROB_MIN_BALANCE) {
+      return message.reply('❌ You need at least **' + fmt(ROB_MIN_BALANCE) + '** wallet coins to attempt a robbery.');
+    }
+
+    const victim = await getUser(target.id);
+    if (victim.balance < ROB_MIN_BALANCE) {
+      return message.reply('❌ <@' + target.id + '> needs at least **' + fmt(ROB_MIN_BALANCE) + '** wallet coins to be robbed.');
+    }
+    if (amount > victim.balance) {
+      return message.reply('❌ <@' + target.id + '> only has **' + fmt(victim.balance) + '** coins in their wallet — amount cannot exceed that.');
+    }
+
+    // Atomically claim the cooldown slot first so concurrent !rob spam can't double-fire
+    const claimed = await User.findOneAndUpdate(
+      { userId: userId, lastRob: robber.lastRob || 0, balance: { $gte: ROB_MIN_BALANCE } },
+      { $set: { lastRob: now } },
+      { new: true }
+    );
+    if (!claimed) {
+      return message.reply('⏳ Rob is on cooldown! Try again shortly.');
+    }
+
+    const success = Math.random() < ROB_SUCCESS_RATE;
+
+    let embed;
+    if (success) {
+      // Atomic transfer — only if victim still has enough wallet balance
+      const victimUpdated = await User.findOneAndUpdate(
+        { userId: target.id, balance: { $gte: amount } },
+        { $inc: { balance: -amount } },
+        { new: true }
+      );
+      if (!victimUpdated) {
+        return message.reply('❌ <@' + target.id + '> no longer has enough coins to rob. Try again later.');
+      }
+      const robberUpdated = await User.findOneAndUpdate(
+        { userId: userId },
+        { $inc: { balance: amount, totalWon: amount } },
+        { new: true }
+      );
+      embed = new EmbedBuilder()
+        .setColor('#2ECC71')
+        .setTitle('🦹  Robbery Successful!')
+        .setDescription(SEP)
+        .addFields(
+          { name: '🎯 Target',     value: '<@' + target.id + '>',                          inline: true },
+          { name: '💰 Stolen',     value: '**+' + fmt(amount) + '** coins',                 inline: true },
+          { name: '🏦 Your Wallet', value: '**' + fmt(robberUpdated.balance) + '** coins',  inline: true },
+        )
+        .setFooter({ text: 'Bank balances are always protected from robbery' });
+    } else {
+      const penalty = Math.floor(amount * ROB_FAIL_PENALTY);
+      const robberUpdated = await User.findOneAndUpdate(
+        { userId: userId, balance: { $gte: penalty } },
+        { $inc: { balance: -penalty, totalLost: penalty } },
+        { new: true }
+      );
+      const finalBalance = robberUpdated ? robberUpdated.balance : robber.balance;
+      embed = new EmbedBuilder()
+        .setColor('#FF4444')
+        .setTitle('🚨  Robbery Failed!')
+        .setDescription(SEP)
+        .addFields(
+          { name: '🎯 Target',      value: '<@' + target.id + '>',           inline: true },
+          { name: '💸 Penalty',     value: '**-' + fmt(penalty) + '** coins', inline: true },
+          { name: '🏦 Your Wallet', value: '**' + fmt(finalBalance) + '** coins', inline: true },
+        )
+        .setFooter({ text: 'You got caught! 60% chance of failure each attempt' });
+    }
+
+    return message.reply({ embeds: [embed] });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   //  SHOP
   // ─────────────────────────────────────────────────────────────────────────
   if (command === 'shop') {
@@ -899,6 +1100,7 @@ client.on('messageCreate', async function(message) {
     await attachShopCollector(msg, userId);
     return;
   }
+
 
   // ─────────────────────────────────────────────────────────────────────────
   //  ARM RISK TOKEN
@@ -1197,10 +1399,11 @@ client.on('messageCreate', async function(message) {
   //  !roulette black  <bet>
   //  !roulette odd    <bet>
   //  !roulette even   <bet>
+  //  !roulette green  <bet>
   //  !roulette number <0-36> <bet>
   // ─────────────────────────────────────────────────────────────────────────
   if (command === 'roulette' || command === 'rou') {
-    const validTypes = ['red','black','odd','even','number'];
+    const validTypes = ['red','black','odd','even','green','number'];
     const betType    = args[0] ? args[0].toLowerCase() : null;
 
     if (!betType || !validTypes.includes(betType)) {
@@ -1210,6 +1413,7 @@ client.on('messageCreate', async function(message) {
         '`!roulette black <bet>`\n' +
         '`!roulette odd <bet>`\n' +
         '`!roulette even <bet>`\n' +
+        '`!roulette green <bet>`\n' +
         '`!roulette number <0-36> <bet>`'
       );
     }
@@ -1258,20 +1462,21 @@ client.on('messageCreate', async function(message) {
 
     await trackGame(userId, 'roulette');
 
-    // Spin the wheel (0–36)
+    // Spin the wheel (0–36) — single source of truth, no conflicting matches
     const landed      = Math.floor(Math.random() * 37);
     const landedColor = rouletteColor(landed);
     const colorEmoji  = landedColor === 'red' ? '🔴' : landedColor === 'black' ? '⚫' : '🟢';
 
-    // Determine win
+    // Determine win — exactly one bet type evaluated, exactly one payout used
     let won    = false;
     let payout = 2;
 
-    if      (betType === 'red')    { won = landedColor === 'red';                payout = 2;  }
-    else if (betType === 'black')  { won = landedColor === 'black';              payout = 2;  }
-    else if (betType === 'odd')    { won = landed !== 0 && landed % 2 === 1;     payout = 2;  }
-    else if (betType === 'even')   { won = landed !== 0 && landed % 2 === 0;     payout = 2;  }
-    else if (betType === 'number') { won = landed === chosenNumber;               payout = 35; }
+    if      (betType === 'red')    { won = landedColor === 'red';              payout = 2;  }
+    else if (betType === 'black')  { won = landedColor === 'black';            payout = 2;  }
+    else if (betType === 'odd')    { won = landed !== 0 && landed % 2 === 1;   payout = 2;  }
+    else if (betType === 'even')   { won = landed !== 0 && landed % 2 === 0;   payout = 2;  }
+    else if (betType === 'green')  { won = landedColor === 'green';            payout = 35; }
+    else if (betType === 'number') { won = landed === chosenNumber;            payout = 35; }
 
     const fresh = await getUser(userId);
     let coinsText, embedColor, resultTitle;
@@ -1282,7 +1487,7 @@ client.on('messageCreate', async function(message) {
       await User.findOneAndUpdate({ userId: userId }, { $inc: { balance: win, totalWon: win } });
       fresh.balance += win;
       await recordWin(fresh, net);
-      if (betType === 'number')
+      if (betType === 'number' || betType === 'green')
         await User.updateOne({ userId: userId }, { $addToSet: { achievements: 'ROULETTE_35' } });
       resultTitle = '🏆  Winner!' + riskTag;
       coinsText   = '**+' + fmt(win) + '** coins  *(net: +' + fmt(net) + ')*';
@@ -1304,7 +1509,9 @@ client.on('messageCreate', async function(message) {
 
     const betLabel = betType === 'number'
       ? '#' + chosenNumber + ' (35×)'
-      : betType.charAt(0).toUpperCase() + betType.slice(1) + ' (2×)';
+      : betType === 'green'
+        ? 'Green (35×)'
+        : betType.charAt(0).toUpperCase() + betType.slice(1) + ' (2×)';
 
     const embed = new EmbedBuilder()
       .setColor(embedColor)
@@ -1317,7 +1524,7 @@ client.on('messageCreate', async function(message) {
         { name: '🏦 Wallet',     value: '**' + fmt(fresh.balance) + '** coins',                    inline: true },
         { name: '🔥 Win Streak', value: String(fresh.winStreak),                                    inline: true },
       )
-      .setFooter({ text: 'European Roulette 0–36  •  Red/Black/Odd/Even = 2×  •  Number = 35×  •  0 = Green (all lose)' });
+      .setFooter({ text: 'European Roulette 0–36  •  Red/Black/Odd/Even = 2×  •  Green/Number = 35×  •  0 = Green' });
     return message.reply({ embeds: [embed] });
   }
 
