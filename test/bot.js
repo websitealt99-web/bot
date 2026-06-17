@@ -173,9 +173,9 @@ function checkAchievements(user) {
 //  CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const SS_BASE_CD = 20_000;   // 20 seconds
-const SS_FAST_CD =  5_000;   // 5 seconds
-const BANK_MAX   = 5_000_000;
+const SS_BASE_CD = 0;   // 20 seconds
+const SS_FAST_CD =  0;   // 5 seconds
+const BANK_MAX   = 0;
 const SEP        = '━━━━━━━━━━━━━━━━━━━━━━━━';
 
 // European roulette numbers
