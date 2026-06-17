@@ -1826,12 +1826,8 @@ client.on('messageCreate', async function(message) {
       .setFooter({ text: 'Good luck! 🍀  |  Use !profile to track all your stats' });
     return message.reply({ embeds: [embed] });
   }
-});
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CAt and Drr
-// ═══════════════════════════════════════════════════════════════════════════════
-  if (command === 'cat') {
+   if (command === 'cat') {
     const cats = [
       'https://giphy.com/gifs/chubbiverse-chubbicorns-chubbicorn-chubbifrens-yF4Y0v5jgJW7k7bAxE',
       'https://tenor.com/view/gif-gif-11244246814270150217',
@@ -1844,6 +1840,7 @@ client.on('messageCreate', async function(message) {
       cats[Math.floor(Math.random() * cats.length)]
     );
   }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BOOT
