@@ -18,11 +18,6 @@ const MONGO = process.env.TEST_ABC_123;
 const PREFIX = '!';
 const JACKPOT_CHANNEL = process.env.JACKPOT_CHANNEL_ID || null;
 
-// ── ROLE IDs (replace with real IDs) ──────────────────────────────────────────
-const ROLE_FASTCD  = '1234567';
-const ROLE_GAMBLER = '1234567';
-const ROLE_VIP     = '1234567';
-
 if (!TOKEN) { console.error('❌  DISCORD_TOKEN missing'); process.exit(1); }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -65,12 +60,16 @@ const userSchema = new mongoose.Schema({
     gamblerRole:    { type: Boolean, default: false },
     luckyCharm:     { type: Boolean, default: false },
     vip:            { type: Boolean, default: false },
-  },
-  roleExpiry: {
-    gamblerRole:    { type: Number, default: 0 },
-    vip:            { type: Number, default: 0 },
+    jackpotTickets: { type: Number,  default: 0 },
+    mysteryCrates:  { type: Number,  default: 0 },
+    riskTokens:     { type: Number,  default: 0 },
   },
   achievements: { type: [String], default: [] },
+  flags: {
+    vip:          { type: Boolean, default: false },
+    gambler:      { type: Boolean, default: false },
+    fastCooldown: { type: Boolean, default: false },
+  },
 }, { timestamps: true });
 
 const User = mongoose.models.User || mongoose.model('User', userSchema);
@@ -91,7 +90,7 @@ async function saveUser(user) {
 
 // Gambler multiplier: applies 1.1x to positive winnings if owned
 function applyGambler(user, amount) {
-  if (amount > 0 && user.inventory && user.inventory.gamblerRole)
+  if (amount > 0 && (user.inventory?.gamblerRole || user.flags?.gambler))
     return Math.floor(amount * 1.1);
   return amount;
 }
@@ -204,39 +203,49 @@ function rouletteColor(n) {
   return 'black';
 }
 
-// Role pricing for timed purchases
-const ROLE_PRICES = {
-  gambler: { 3: 300_000, 7: 700_000, 28: 2_800_000 },
-  vip:     { 3: 750_000, 7: 1_750_000, 28: 7_000_000 },
-};
-
 const SHOP_ITEMS = {
   fastcooldown: {
     key: 'fastcooldown', name: '⚡ Fast Cooldown', emoji: '⚡',
-    desc: 'Super Slots cooldown: 20s → 5s  **(Permanent)**',
+    desc: 'Lowers Super Slots cooldown: 20s → 5s  **(Permanent)**',
     price: 10_000_000, type: 'permanent', field: 'fastCooldown',
-  },
-  luckycharm: {
-    key: 'luckycharm', name: '🍀 Lucky Charm', emoji: '🍀',
-    desc: '+5% bonus weight on slots spins  **(Permanent)**',
-    price: 5_000_000, type: 'permanent', field: 'luckyCharm',
   },
   gambler: {
     key: 'gambler', name: '🎩 Gambler Role', emoji: '🎩',
-    desc: 'All winnings ×1.1 — 3/7/28 days',
-    type: 'timed', field: 'gamblerRole',
+    desc: 'All winnings multiplied by **1.1×**  **(Permanent)**',
+    price: 50_000_000, type: 'permanent', field: 'gamblerRole',
+  },
+  risktoken: {
+    key: 'risktoken', name: '🔥 Risk Token', emoji: '🔥',
+    desc: 'Consumable — 5× win **or** 5× loss on next BJ/Roulette',
+    price: 2_500_000, type: 'consumable', field: 'riskTokens',
+  },
+  luckycharm: {
+    key: 'luckycharm', name: '🍀 Lucky Charm', emoji: '🍀',
+    desc: '+5% bonus weight on every slots spin  **(Permanent)**',
+    price: 5_000_000, type: 'permanent', field: 'luckyCharm',
   },
   vip: {
     key: 'vip', name: '💎 VIP', emoji: '💎',
-    desc: 'VIP badge + hidden multipliers — 3/7/28 days',
-    type: 'timed', field: 'vip',
+    desc: 'VIP badge on profile + hidden bonus multipliers  **(Permanent)**',
+    price: 100_000_000, type: 'permanent', field: 'vip',
+  },
+  jackpotticket: {
+    key: 'jackpotticket', name: '🎟 Jackpot Ticket', emoji: '🎟',
+    desc: 'Consumable — grants 1 free Super Slots spin (min bet)',
+    price: 500_000, type: 'consumable', field: 'jackpotTickets',
+  },
+  mysterycrate: {
+    key: 'mysterycrate', name: '📦 Mystery Crate', emoji: '📦',
+    desc: 'Consumable — open for a random coin reward or item!',
+    price: 750_000, type: 'consumable', field: 'mysteryCrates',
   },
 };
 
 // In-memory session maps
 const activeGames = new Map(); // userId -> gameId (blocks duplicate BJ)
 const bjGames     = new Map(); // gameId -> game state
-const shopDurQty  = new Map(); // userId -> selected duration for role shop
+const armedRisk   = new Map(); // userId -> true
+const riskBuyQty  = new Map(); // userId -> qty
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  UTILITY
@@ -267,193 +276,97 @@ function fmtCooldown(ms) {
 //  SHOP UI
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  TEMPORARY ROLE SYSTEM
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Grant a temporary role (or extend if somehow needed — currently no stacking)
-async function grantTempRole(guild, userId, roleKey, days) {
-  const roleId  = roleKey === 'gamblerRole' ? ROLE_GAMBLER : ROLE_VIP;
-  const expiry  = Date.now() + days * 86_400_000;
-  const invField   = 'inventory.' + roleKey;
-  const expiryField = 'roleExpiry.' + roleKey;
-
-  await User.findOneAndUpdate(
-    { userId },
-    { $set: { [invField]: true, [expiryField]: expiry } }
-  );
-
-  if (guild) {
-    const member = await guild.members.fetch(userId).catch(function() { return null; });
-    if (member) await member.roles.add(roleId).catch(function() {});
-  }
-}
-
-// Check and remove expired temporary roles (call this on each message)
-async function checkRoleExpiry(guild, userId) {
-  const u = await getUser(userId);
-  const now = Date.now();
-  const updates = {};
-  const rolesToRemove = [];
-
-  if (u.roleExpiry && u.roleExpiry.gamblerRole && now > u.roleExpiry.gamblerRole && u.inventory && u.inventory.gamblerRole) {
-    updates['inventory.gamblerRole']  = false;
-    updates['roleExpiry.gamblerRole'] = 0;
-    rolesToRemove.push(ROLE_GAMBLER);
-  }
-  if (u.roleExpiry && u.roleExpiry.vip && now > u.roleExpiry.vip && u.inventory && u.inventory.vip) {
-    updates['inventory.vip']  = false;
-    updates['roleExpiry.vip'] = 0;
-    rolesToRemove.push(ROLE_VIP);
-  }
-
-  if (Object.keys(updates).length) {
-    await User.findOneAndUpdate({ userId }, { $set: updates });
-    if (guild && rolesToRemove.length) {
-      const member = await guild.members.fetch(userId).catch(function() { return null; });
-      if (member) {
-        for (const rId of rolesToRemove) await member.roles.remove(rId).catch(function() {});
-      }
-    }
-  }
-}
-
-// 0.1% Gambler Role drop helper — call after any economy/gambling command
-async function tryGamblerDrop(message, userId) {
-  if (Math.random() > 0.001) return; // 0.1% chance
-  const u = await getUser(userId);
-  if (message.member.roles.cache.has(ROLE_GAMBLER)) return; // already has it
-  await grantTempRole(message.guild, userId, 'gamblerRole', 7);
-  await message.channel.send({
-    embeds: [
-      new EmbedBuilder()
-        .setColor('#FF6600')
-        .setTitle('🎩  Rare Drop!')
-        .setDescription('<@' + userId + '> just received the **Gambler Role** for **7 days** from a rare 0.1% drop! 🍀'),
-    ],
-  }).catch(function() {});
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SHOP UI
-// ═══════════════════════════════════════════════════════════════════════════════
-
-function fmtExpiry(ts) {
-  if (!ts) return 'Not owned';
-  const rem = ts - Date.now();
-  if (rem <= 0) return 'Expired';
-  const d = Math.floor(rem / 86_400_000);
-  const h = Math.floor((rem % 86_400_000) / 3_600_000);
-  return d > 0 ? d + 'd ' + h + 'h left' : h + 'h left';
-}
-
-function buildShopEmbed(user, member) {
-  const inv = user.inventory || {};
-
-  const hasFastCD = member?.roles?.cache?.has(ROLE_FASTCD);
-  const hasGambler = member?.roles?.cache?.has(ROLE_GAMBLER);
-  const hasVIP = member?.roles?.cache?.has(ROLE_VIP);
-
-  const lines = [
-    '⚡ **Fast Cooldown** — 3d: 150,000 · 7d: 350,000 · 28d: 1,400,000' +
-      (hasFastCD ? '  ✅ **OWNED**' : ''),
-
-    '🍀 **Lucky Charm** — **' + fmt(SHOP_ITEMS.luckycharm.price) + '** coins' +
-      (inv.luckyCharm ? '  ✅ **OWNED**' : ''),
-
-    '🎩 **Gambler Role** — 3d: ' + fmt(ROLE_PRICES.gambler[3]) +
-      ' · 7d: ' + fmt(ROLE_PRICES.gambler[7]) +
-      ' · 28d: ' + fmt(ROLE_PRICES.gambler[28]) +
-      (hasGambler ? '  ✅ **OWNED**' : ''),
-
-    '💎 **VIP** — 3d: ' + fmt(ROLE_PRICES.vip[3]) +
-      ' · 7d: ' + fmt(ROLE_PRICES.vip[7]) +
-      ' · 28d: ' + fmt(ROLE_PRICES.vip[28]) +
-      (hasVIP ? '  ✅ **OWNED**' : ''),
-  ].join('\n\n');
+function buildShopEmbed(user, qty) {
+  if (qty === undefined) qty = 1;
+  const inv   = user.inventory || {};
+  const lines = Object.values(SHOP_ITEMS).map(function(item) {
+    let owned = '';
+    if (item.type === 'permanent') owned = inv[item.field] ? '  ✅ **OWNED**' : '';
+    else owned = '  📦 **Owned: ' + (inv[item.field] || 0) + '**';
+    const price = item.type === 'consumable'
+      ? fmt(item.price) + ' × ' + qty + ' = **' + fmt(item.price * qty) + '** coins'
+      : '**' + fmt(item.price) + '** coins';
+    return item.emoji + ' **' + item.name + '** — ' + price + '\n┗ ' + item.desc + owned;
+  }).join('\n\n');
 
   return new EmbedBuilder()
     .setColor('#9B59B6')
-    .setTitle('🛒 Casino Shop')
+    .setTitle('🛒  Casino Shop')
     .setDescription(SEP + '\n' + lines + '\n' + SEP)
-    .addFields({
-      name: '💰 Wallet',
-      value: '**' + fmt(user.balance) + '** coins',
-      inline: true
-    });
+    .addFields({ name: '💰 Wallet Balance', value: '**' + fmt(user.balance) + '** coins', inline: true })
+    .setFooter({ text: 'Use the buttons below to purchase • Permanent items bought once' });
 }
 
-function buildShopRows(user, member) {
-  const hasFastCD = member?.roles?.cache?.has(ROLE_FASTCD);
-  const hasGambler = member?.roles?.cache?.has(ROLE_GAMBLER);
-  const hasVIP = member?.roles?.cache?.has(ROLE_VIP);
-
+function buildShopRows(user, qty) {
+  if (qty === undefined) qty = 1;
+  const inv = user.inventory || {};
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('shop_fastcooldown')
-      .setEmoji('⚡')
-      .setLabel(hasFastCD ? 'Owned ✅' : 'Fast Cooldown')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(hasFastCD),
-
-    new ButtonBuilder()
-      .setCustomId('shop_luckycharm')
-      .setEmoji('🍀')
-      .setLabel(user.inventory?.luckyCharm ? 'Owned ✅' : 'Lucky Charm')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(!!user.inventory?.luckyCharm),
+    new ButtonBuilder().setCustomId('shop_fastcooldown').setEmoji('⚡')
+      .setLabel(inv.fastCooldown ? 'Owned ✅' : 'Fast Cooldown')
+      .setStyle(ButtonStyle.Primary).setDisabled(!!inv.fastCooldown),
+    new ButtonBuilder().setCustomId('shop_gambler').setEmoji('🎩')
+      .setLabel(inv.gamblerRole ? 'Owned ✅' : 'Gambler Role')
+      .setStyle(ButtonStyle.Success).setDisabled(!!inv.gamblerRole),
+    new ButtonBuilder().setCustomId('shop_luckycharm').setEmoji('🍀')
+      .setLabel(inv.luckyCharm ? 'Owned ✅' : 'Lucky Charm')
+      .setStyle(ButtonStyle.Primary).setDisabled(!!inv.luckyCharm),
+    new ButtonBuilder().setCustomId('shop_vip').setEmoji('💎')
+      .setLabel(inv.vip ? 'Owned ✅' : 'VIP')
+      .setStyle(ButtonStyle.Success).setDisabled(!!inv.vip),
   );
-
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('shop_gambler')
-      .setEmoji('🎩')
-      .setLabel(hasGambler ? 'Owned ✅' : 'Gambler Role')
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(hasGambler),
-
-    new ButtonBuilder()
-      .setCustomId('shop_vip')
-      .setEmoji('💎')
-      .setLabel(hasVIP ? 'Owned ✅' : 'VIP')
-      .setStyle(ButtonStyle.Success)
-      .setDisabled(hasVIP),
+    new ButtonBuilder().setCustomId('shop_qty_minus').setLabel('−').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('shop_qty_display').setLabel('Qty: ' + qty).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId('shop_qty_plus').setLabel('+').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('shop_risktoken').setEmoji('🔥')
+      .setLabel('Risk Token  (' + fmt(SHOP_ITEMS.risktoken.price * qty) + ')')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId('shop_mysterycrate').setEmoji('📦')
+      .setLabel('Mystery Crate  (' + fmt(SHOP_ITEMS.mysterycrate.price * qty) + ')')
+      .setStyle(ButtonStyle.Secondary),
   );
-
-  return [row1, row2];
-}
-
-function buildDurationRow(roleKey) {
-  const prices = ROLE_PRICES[roleKey];
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('role_' + roleKey + '_3')
-      .setLabel('3 Days — ' + fmt(prices[3])).setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('role_' + roleKey + '_7')
-      .setLabel('7 Days — ' + fmt(prices[7])).setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('role_' + roleKey + '_28')
-      .setLabel('28 Days — ' + fmt(prices[28])).setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('role_back')
-      .setLabel('← Back').setStyle(ButtonStyle.Secondary),
-  )];
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('shop_jackpotticket').setEmoji('🎟')
+      .setLabel('Jackpot Ticket  (' + fmt(SHOP_ITEMS.jackpotticket.price * qty) + ')')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('shop_arm_risk').setEmoji('🎯')
+      .setLabel('Arm Risk Token')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled((inv.riskTokens || 0) <= 0),
+  );
+  return [row1, row2, row3];
 }
 
 async function attachShopCollector(msg, ownerId) {
+  riskBuyQty.set(ownerId, 1);
   const collector = msg.createMessageComponentCollector({ time: 120_000 });
 
   collector.on('collect', async function(ix) {
     if (ix.user.id !== ownerId)
       return ix.reply({ content: '❌ Open your own shop with `!shop`', ephemeral: true });
 
-    // Back to main shop
-    if (ix.customId === 'role_back') {
+    let qty = riskBuyQty.get(ownerId) || 1;
+
+    // Qty adjustments — fetch fresh user after each change
+    if (ix.customId === 'shop_qty_minus') {
+      qty = Math.max(1, qty - 1);
+      riskBuyQty.set(ownerId, qty);
       const u = await getUser(ownerId);
-      return ix.update({ embeds: [buildShopEmbed(u)], components: buildShopRows(u) });
+      return ix.update({ embeds: [buildShopEmbed(u, qty)], components: buildShopRows(u, qty) });
+    }
+    if (ix.customId === 'shop_qty_plus') {
+      qty = Math.min(99, qty + 1);
+      riskBuyQty.set(ownerId, qty);
+      const u = await getUser(ownerId);
+      return ix.update({ embeds: [buildShopEmbed(u, qty)], components: buildShopRows(u, qty) });
     }
 
-    // Permanent items
+    // Permanent items — atomic purchase
     const permanentMap = {
       shop_fastcooldown: { item: SHOP_ITEMS.fastcooldown, field: 'fastCooldown' },
+      shop_gambler:      { item: SHOP_ITEMS.gambler,      field: 'gamblerRole'  },
       shop_luckycharm:   { item: SHOP_ITEMS.luckycharm,   field: 'luckyCharm'   },
+      shop_vip:          { item: SHOP_ITEMS.vip,          field: 'vip'          },
     };
     if (permanentMap[ix.customId]) {
       const { item, field } = permanentMap[ix.customId];
@@ -465,74 +378,41 @@ async function attachShopCollector(msg, ownerId) {
       );
       if (!updated) return ix.reply({ content: '❌ Purchase failed — already owned or insufficient funds.', ephemeral: true });
       await ix.reply({ content: '✅ Purchased **' + item.name + '**!', ephemeral: true });
-      return ix.message.edit({ embeds: [buildShopEmbed(updated)], components: buildShopRows(updated) });
+      return ix.message.edit({ embeds: [buildShopEmbed(updated, qty)], components: buildShopRows(updated, qty) });
     }
 
-    // Role selection — show duration buttons
-    if (ix.customId === 'shop_gambler') {
-      const u = await getUser(ownerId);
-      if (message.member.roles.cache.has(ROLE_GAMBLER))
-        return ix.reply({ content: '❌ You already have Gambler Role. Cannot stack.', ephemeral: true });
-      return ix.update({
-        embeds: [new EmbedBuilder().setColor('#FF6600').setTitle('🎩  Gambler Role — Choose Duration').setDescription(
-          '3 Days — **' + fmt(ROLE_PRICES.gambler[3]) + '** coins\n' +
-          '7 Days — **' + fmt(ROLE_PRICES.gambler[7]) + '** coins\n' +
-          '28 Days — **' + fmt(ROLE_PRICES.gambler[28]) + '** coins'
-        )],
-        components: buildDurationRow('gambler'),
-      });
-    }
-    if (ix.customId === 'shop_vip') {
-      if (ix.member.roles.cache.has(ROLE_VIP))
-        return ix.reply({
-          content: '❌ You already have VIP. Cannot stack.',
-          ephemeral: true
-        });
-
-      return ix.update({
-        embeds: [
-          new EmbedBuilder()
-            .setColor('#9B59B6')
-            .setTitle('💎 VIP — Choose Duration')
-            .setDescription(
-              '3 Days — **' + fmt(ROLE_PRICES.vip[3]) + '** coins\n' +
-              '7 Days — **' + fmt(ROLE_PRICES.vip[7]) + '** coins\n' +
-              '28 Days — **' + fmt(ROLE_PRICES.vip[28]) + '** coins'
-            )
-        ],
-        components: [buildDurationRow('vip')],
-      });
-    }
-
-    // Duration buttons: role_gambler_3, role_gambler_7, role_gambler_28, role_vip_3, etc.
-    const durMatch = ix.customId.match(/^role_(gambler|vip)_(\d+)$/);
-    if (durMatch) {
-      const roleKey = durMatch[1];
-      const days    = parseInt(durMatch[2]);
-      const price   = ROLE_PRICES[roleKey][days];
-      const invField = 'inventory.' + (roleKey === 'gambler' ? 'gamblerRole' : 'vip');
-
-      // Deny if already has role
-      const check = await getUser(ownerId);
-      if (check.inventory && check.inventory[roleKey === 'gambler' ? 'gamblerRole' : 'vip'])
-        return ix.reply({ content: '❌ You already have this role. Cannot stack.', ephemeral: true });
-
+    // Consumable items — atomic purchase
+    const consumableMap = {
+      shop_risktoken:     { item: SHOP_ITEMS.risktoken,     field: 'riskTokens'     },
+      shop_jackpotticket: { item: SHOP_ITEMS.jackpotticket, field: 'jackpotTickets' },
+      shop_mysterycrate:  { item: SHOP_ITEMS.mysterycrate,  field: 'mysteryCrates'  },
+    };
+    if (consumableMap[ix.customId]) {
+      const { item, field } = consumableMap[ix.customId];
+      const cost      = item.price * qty;
+      const invField  = 'inventory.' + field;
       const updated = await User.findOneAndUpdate(
-        { userId: ownerId, balance: { $gte: price }, [invField]: { $ne: true } },
-        { $inc: { balance: -price } },
+        { userId: ownerId, balance: { $gte: cost } },
+        { $inc: { balance: -cost, [invField]: qty } },
         { new: true }
       );
-      if (!updated) return ix.reply({ content: '❌ Insufficient funds or already owned.', ephemeral: true });
+      if (!updated) return ix.reply({ content: '❌ Need **' + fmt(cost) + '** coins.', ephemeral: true });
+      await ix.reply({ content: '✅ Purchased **' + qty + '× ' + item.name + '**!', ephemeral: true });
+      return ix.message.edit({ embeds: [buildShopEmbed(updated, qty)], components: buildShopRows(updated, qty) });
+    }
 
-      const dbKey = roleKey === 'gambler' ? 'gamblerRole' : 'vip';
-      await grantTempRole(ix.guild, ownerId, dbKey, days);
-      const fresh = await getUser(ownerId);
-      await ix.reply({ content: '✅ Purchased **' + (roleKey === 'gambler' ? 'Gambler Role' : 'VIP') + '** for **' + days + ' days**!', ephemeral: true });
-      return ix.message.edit({ embeds: [buildShopEmbed(fresh)], components: buildShopRows(fresh) });
+    // Arm risk token
+    if (ix.customId === 'shop_arm_risk') {
+      const u = await getUser(ownerId);
+      if ((u.inventory.riskTokens || 0) <= 0) return ix.reply({ content: '❌ No Risk Tokens.', ephemeral: true });
+      if (armedRisk.get(ownerId)) return ix.reply({ content: '⚠️ Already armed for next round.', ephemeral: true });
+      armedRisk.set(ownerId, true);
+      return ix.reply({ content: '🔥 **Risk Token armed!** Your next BJ or Roulette round is 5× win/loss.', ephemeral: true });
     }
   });
 
   collector.on('end', function() {
+    riskBuyQty.delete(ownerId);
     msg.edit({ components: [] }).catch(function() {});
   });
 }
@@ -621,9 +501,12 @@ client.on('messageCreate', async function(message) {
       .setThumbnail(author.displayAvatarURL())
       .setDescription(badges ? badges + '\n' + SEP : SEP)
       .addFields(
-        { name: '💵 Wallet',     value: '**' + fmt(u.balance) + '** coins',  inline: true },
-        { name: '📈 Total Won',  value: fmt(u.totalWon) + ' coins',           inline: true },
-        { name: '📉 Total Lost', value: fmt(u.totalLost) + ' coins',          inline: true },
+        { name: '💵 Wallet',      value: '**' + fmt(u.balance) + '** coins',       inline: true },
+        { name: '📈 Total Won',   value: fmt(u.totalWon) + ' coins',                inline: true },
+        { name: '📉 Total Lost',  value: fmt(u.totalLost) + ' coins',               inline: true },
+        { name: '🔥 Risk Tokens', value: String(inv.riskTokens || 0),               inline: true },
+        { name: '🎟 Tickets',     value: String(inv.jackpotTickets || 0),            inline: true },
+        { name: '📦 Crates',      value: String(inv.mysteryCrates || 0),             inline: true },
       )
       .setFooter({ text: 'Win Rate: ' + winRate(u) + '  •  Games: ' + fmt(u.gamesPlayed) + '  •  Use !bank to view bank balance' });
     return message.reply({ embeds: [embed] });
@@ -1374,18 +1257,6 @@ client.on('messageCreate', async function(message) {
         .setFooter({ text: 'Hit or Stand? (60s timeout → auto-stand)' });
     }
 
-    function hasFastCD(member) {
-      return member.roles.cache.has(ROLE_FASTCD);
-    }
-
-    function hasGambler(member) {
-      return member.roles.cache.has(ROLE_GAMBLER);
-    }
-
-    function hasVIP(member) {
-      return member.roles.cache.has(ROLE_VIP);
-    }
-
     const hitBtn   = new ButtonBuilder().setCustomId('bj_hit_' + gameId).setLabel('HIT').setStyle(ButtonStyle.Primary).setEmoji('👊');
     const standBtn = new ButtonBuilder().setCustomId('bj_stand_' + gameId).setLabel('STAND').setStyle(ButtonStyle.Secondary).setEmoji('✋');
     const bjRow    = new ActionRowBuilder().addComponents(hitBtn, standBtn);
@@ -1964,29 +1835,15 @@ client.on('messageCreate', async function(message) {
     const cats = [
       'https://giphy.com/gifs/chubbiverse-chubbicorns-chubbicorn-chubbifrens-yF4Y0v5jgJW7k7bAxE',
       'https://tenor.com/view/gif-gif-11244246814270150217',
-      'cat 3',
-      'cat 4',
-      'cat 5',
+      'https://cdn.discordapp.com/attachments/1297220928262115371/1508379676748288080/Car_P.gif',
+      'https://cdn.discordapp.com/attachments/1319378520316710983/1509199781162123438/200w.gif',
+      'https://cdn.discordapp.com/attachments/1297220928262115371/1475460327943573556/1000044567.gif',
     ];
 
     return message.reply(
       cats[Math.floor(Math.random() * cats.length)]
     );
   }
-
-  if (command === 'durr') {
-    const durrs = [
-      'durr 1',
-      'durr 2',
-      'durr 3',
-      'durr 4',
-    ];
-
-    return message.reply(
-      durrs[Math.floor(Math.random() * durrs.length)]
-    );
-  }
-
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BOOT
