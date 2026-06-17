@@ -11,7 +11,7 @@ const {
 const mongoose = require('mongoose');
 
 // ── ENV ────────────────────────────────────────────────────────────────────────
-require('dotenv').config();
+// require('dotenv').config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const MONGO = process.env.MONGO_URI;
