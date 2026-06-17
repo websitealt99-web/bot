@@ -14,7 +14,7 @@ const mongoose = require('mongoose');
 // require('dotenv').config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const MONGO = process.env.MONGO_URI;
+const MONGO = process.env.TEST_ABC_123;
 const PREFIX = '!';
 const JACKPOT_CHANNEL = process.env.JACKPOT_CHANNEL_ID || null;
 
