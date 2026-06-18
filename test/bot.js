@@ -18,6 +18,12 @@ const MONGO = process.env.TEST_ABC_123;
 const PREFIX = '!';
 const JACKPOT_CHANNEL = process.env.JACKPOT_CHANNEL_ID || null;
 
+// ── ROLE IDs ───────────────────────────────────────────────────────────────────
+const ROLE_VIP     = '1234567';
+const ROLE_FASTCD  = '1234567';
+const ROLE_GAMBLER = '1234567';
+const ROLE_LUCKY   = '1234567';
+
 if (!TOKEN) { console.error('❌  DISCORD_TOKEN missing'); process.exit(1); }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -88,9 +94,10 @@ async function saveUser(user) {
   return user.save();
 }
 
-// Gambler multiplier: applies 1.1x to positive winnings if owned
-function applyGambler(user, amount) {
-  if (amount > 0 && (user.inventory?.gamblerRole || user.flags?.gambler))
+// Gambler multiplier: applies 1.1× to positive winnings if member has Gambler role
+// member may be a GuildMember (live) or null (fallback = no bonus)
+function applyGambler(member, amount) {
+  if (amount > 0 && hasGambler(member))
     return Math.floor(amount * 1.1);
   return amount;
 }
@@ -203,49 +210,13 @@ function rouletteColor(n) {
   return 'black';
 }
 
-const SHOP_ITEMS = {
-  fastcooldown: {
-    key: 'fastcooldown', name: '⚡ Fast Cooldown', emoji: '⚡',
-    desc: 'Lowers Super Slots cooldown: 20s → 5s  **(Permanent)**',
-    price: 10_000_000, type: 'permanent', field: 'fastCooldown',
-  },
-  gambler: {
-    key: 'gambler', name: '🎩 Gambler Role', emoji: '🎩',
-    desc: 'All winnings multiplied by **1.1×**  **(Permanent)**',
-    price: 50_000_000, type: 'permanent', field: 'gamblerRole',
-  },
-  risktoken: {
-    key: 'risktoken', name: '🔥 Risk Token', emoji: '🔥',
-    desc: 'Consumable — 5× win **or** 5× loss on next BJ/Roulette',
-    price: 2_500_000, type: 'consumable', field: 'riskTokens',
-  },
-  luckycharm: {
-    key: 'luckycharm', name: '🍀 Lucky Charm', emoji: '🍀',
-    desc: '+5% bonus weight on every slots spin  **(Permanent)**',
-    price: 5_000_000, type: 'permanent', field: 'luckyCharm',
-  },
-  vip: {
-    key: 'vip', name: '💎 VIP', emoji: '💎',
-    desc: 'VIP badge on profile + hidden bonus multipliers  **(Permanent)**',
-    price: 100_000_000, type: 'permanent', field: 'vip',
-  },
-  jackpotticket: {
-    key: 'jackpotticket', name: '🎟 Jackpot Ticket', emoji: '🎟',
-    desc: 'Consumable — grants 1 free Super Slots spin (min bet)',
-    price: 500_000, type: 'consumable', field: 'jackpotTickets',
-  },
-  mysterycrate: {
-    key: 'mysterycrate', name: '📦 Mystery Crate', emoji: '📦',
-    desc: 'Consumable — open for a random coin reward or item!',
-    price: 750_000, type: 'consumable', field: 'mysteryCrates',
-  },
-};
+// Roles (VIP, FastCD, Gambler, Lucky) are now managed by admins via Discord roles.
+// Add any future purchasable non-role items here.
+const SHOP_ITEMS = {};
 
 // In-memory session maps
 const activeGames = new Map(); // userId -> gameId (blocks duplicate BJ)
 const bjGames     = new Map(); // gameId -> game state
-const armedRisk   = new Map(); // userId -> true
-const riskBuyQty  = new Map(); // userId -> qty
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  UTILITY
@@ -273,148 +244,37 @@ function fmtCooldown(ms) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  ROLE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function hasVIP(member)     { return !!(member && member.roles && member.roles.cache.has(ROLE_VIP));     }
+function hasFastCD(member)  { return !!(member && member.roles && member.roles.cache.has(ROLE_FASTCD));  }
+function hasGambler(member) { return !!(member && member.roles && member.roles.cache.has(ROLE_GAMBLER)); }
+function hasLucky(member)   { return !!(member && member.roles && member.roles.cache.has(ROLE_LUCKY));   }
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  SHOP UI
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function buildShopEmbed(user, qty) {
-  if (qty === undefined) qty = 1;
-  const inv   = user.inventory || {};
-  const lines = Object.values(SHOP_ITEMS).map(function(item) {
-    let owned = '';
-    if (item.type === 'permanent') owned = inv[item.field] ? '  ✅ **OWNED**' : '';
-    else owned = '  📦 **Owned: ' + (inv[item.field] || 0) + '**';
-    const price = item.type === 'consumable'
-      ? fmt(item.price) + ' × ' + qty + ' = **' + fmt(item.price * qty) + '** coins'
-      : '**' + fmt(item.price) + '** coins';
-    return item.emoji + ' **' + item.name + '** — ' + price + '\n┗ ' + item.desc + owned;
-  }).join('\n\n');
+function buildShopEmbed(user) {
+  const items = Object.values(SHOP_ITEMS);
+  const lines = items.length
+    ? items.map(function(item) {
+        return item.emoji + ' **' + item.name + '** — **' + fmt(item.price) + '** coins\n┗ ' + item.desc;
+      }).join('\n\n')
+    : '*No items currently available for purchase.*\n\nRoles (**💎 VIP**, **🎩 Gambler**, **⚡ FastCD**, **🍀 Lucky**) are granted by admins — contact staff to receive them.';
 
   return new EmbedBuilder()
     .setColor('#9B59B6')
     .setTitle('🛒  Casino Shop')
     .setDescription(SEP + '\n' + lines + '\n' + SEP)
     .addFields({ name: '💰 Wallet Balance', value: '**' + fmt(user.balance) + '** coins', inline: true })
-    .setFooter({ text: 'Use the buttons below to purchase • Permanent items bought once' });
+    .setFooter({ text: 'Roles are managed by admins — ask staff for VIP, Gambler, FastCD, or Lucky' });
 }
 
-function buildShopRows(user, qty) {
-  if (qty === undefined) qty = 1;
-  const inv = user.inventory || {};
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('shop_fastcooldown').setEmoji('⚡')
-      .setLabel(inv.fastCooldown ? 'Owned ✅' : 'Fast Cooldown')
-      .setStyle(ButtonStyle.Primary).setDisabled(!!inv.fastCooldown),
-    new ButtonBuilder().setCustomId('shop_gambler').setEmoji('🎩')
-      .setLabel(inv.gamblerRole ? 'Owned ✅' : 'Gambler Role')
-      .setStyle(ButtonStyle.Success).setDisabled(!!inv.gamblerRole),
-    new ButtonBuilder().setCustomId('shop_luckycharm').setEmoji('🍀')
-      .setLabel(inv.luckyCharm ? 'Owned ✅' : 'Lucky Charm')
-      .setStyle(ButtonStyle.Primary).setDisabled(!!inv.luckyCharm),
-    new ButtonBuilder().setCustomId('shop_vip').setEmoji('💎')
-      .setLabel(inv.vip ? 'Owned ✅' : 'VIP')
-      .setStyle(ButtonStyle.Success).setDisabled(!!inv.vip),
-  );
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('shop_qty_minus').setLabel('−').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('shop_qty_display').setLabel('Qty: ' + qty).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId('shop_qty_plus').setLabel('+').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('shop_risktoken').setEmoji('🔥')
-      .setLabel('Risk Token  (' + fmt(SHOP_ITEMS.risktoken.price * qty) + ')')
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('shop_mysterycrate').setEmoji('📦')
-      .setLabel('Mystery Crate  (' + fmt(SHOP_ITEMS.mysterycrate.price * qty) + ')')
-      .setStyle(ButtonStyle.Secondary),
-  );
-  const row3 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('shop_jackpotticket').setEmoji('🎟')
-      .setLabel('Jackpot Ticket  (' + fmt(SHOP_ITEMS.jackpotticket.price * qty) + ')')
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('shop_arm_risk').setEmoji('🎯')
-      .setLabel('Arm Risk Token')
-      .setStyle(ButtonStyle.Danger)
-      .setDisabled((inv.riskTokens || 0) <= 0),
-  );
-  return [row1, row2, row3];
-}
-
-async function attachShopCollector(msg, ownerId) {
-  riskBuyQty.set(ownerId, 1);
-  const collector = msg.createMessageComponentCollector({ time: 120_000 });
-
-  collector.on('collect', async function(ix) {
-    if (ix.user.id !== ownerId)
-      return ix.reply({ content: '❌ Open your own shop with `!shop`', ephemeral: true });
-
-    let qty = riskBuyQty.get(ownerId) || 1;
-
-    // Qty adjustments — fetch fresh user after each change
-    if (ix.customId === 'shop_qty_minus') {
-      qty = Math.max(1, qty - 1);
-      riskBuyQty.set(ownerId, qty);
-      const u = await getUser(ownerId);
-      return ix.update({ embeds: [buildShopEmbed(u, qty)], components: buildShopRows(u, qty) });
-    }
-    if (ix.customId === 'shop_qty_plus') {
-      qty = Math.min(99, qty + 1);
-      riskBuyQty.set(ownerId, qty);
-      const u = await getUser(ownerId);
-      return ix.update({ embeds: [buildShopEmbed(u, qty)], components: buildShopRows(u, qty) });
-    }
-
-    // Permanent items — atomic purchase
-    const permanentMap = {
-      shop_fastcooldown: { item: SHOP_ITEMS.fastcooldown, field: 'fastCooldown' },
-      shop_gambler:      { item: SHOP_ITEMS.gambler,      field: 'gamblerRole'  },
-      shop_luckycharm:   { item: SHOP_ITEMS.luckycharm,   field: 'luckyCharm'   },
-      shop_vip:          { item: SHOP_ITEMS.vip,          field: 'vip'          },
-    };
-    if (permanentMap[ix.customId]) {
-      const { item, field } = permanentMap[ix.customId];
-      const invField = 'inventory.' + field;
-      const updated = await User.findOneAndUpdate(
-        { userId: ownerId, balance: { $gte: item.price }, [invField]: { $ne: true } },
-        { $inc: { balance: -item.price }, $set: { [invField]: true } },
-        { new: true }
-      );
-      if (!updated) return ix.reply({ content: '❌ Purchase failed — already owned or insufficient funds.', ephemeral: true });
-      await ix.reply({ content: '✅ Purchased **' + item.name + '**!', ephemeral: true });
-      return ix.message.edit({ embeds: [buildShopEmbed(updated, qty)], components: buildShopRows(updated, qty) });
-    }
-
-    // Consumable items — atomic purchase
-    const consumableMap = {
-      shop_risktoken:     { item: SHOP_ITEMS.risktoken,     field: 'riskTokens'     },
-      shop_jackpotticket: { item: SHOP_ITEMS.jackpotticket, field: 'jackpotTickets' },
-      shop_mysterycrate:  { item: SHOP_ITEMS.mysterycrate,  field: 'mysteryCrates'  },
-    };
-    if (consumableMap[ix.customId]) {
-      const { item, field } = consumableMap[ix.customId];
-      const cost      = item.price * qty;
-      const invField  = 'inventory.' + field;
-      const updated = await User.findOneAndUpdate(
-        { userId: ownerId, balance: { $gte: cost } },
-        { $inc: { balance: -cost, [invField]: qty } },
-        { new: true }
-      );
-      if (!updated) return ix.reply({ content: '❌ Need **' + fmt(cost) + '** coins.', ephemeral: true });
-      await ix.reply({ content: '✅ Purchased **' + qty + '× ' + item.name + '**!', ephemeral: true });
-      return ix.message.edit({ embeds: [buildShopEmbed(updated, qty)], components: buildShopRows(updated, qty) });
-    }
-
-    // Arm risk token
-    if (ix.customId === 'shop_arm_risk') {
-      const u = await getUser(ownerId);
-      if ((u.inventory.riskTokens || 0) <= 0) return ix.reply({ content: '❌ No Risk Tokens.', ephemeral: true });
-      if (armedRisk.get(ownerId)) return ix.reply({ content: '⚠️ Already armed for next round.', ephemeral: true });
-      armedRisk.set(ownerId, true);
-      return ix.reply({ content: '🔥 **Risk Token armed!** Your next BJ or Roulette round is 5× win/loss.', ephemeral: true });
-    }
-  });
-
-  collector.on('end', function() {
-    riskBuyQty.delete(ownerId);
-    msg.edit({ components: [] }).catch(function() {});
-  });
+function buildShopRows() {
+  // No purchasable items — no buttons needed
+  return [];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
